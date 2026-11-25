@@ -1,0 +1,129 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Compile and test
+        run: mvn -B -ntp verify
+
+      - name: Set image name (must be lowercase)
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
+
+      - name: Validate - container starts and responds
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker run -d --name smoke -p 8080:8080 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8080/actuator/health | grep -q '"status":"UP"'; then
+              echo "Application is healthy"
+              curl -fsS http://localhost:8080/
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs smoke
+          exit 1
+
+      - name: Validate - image does not run as root
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          USER_ID=$(docker image inspect -f '{{.Config.User}}' "$IMAGE")
+          echo "Image user: $USER_ID"
+          test -n "$USER_ID" && test "$USER_ID" != "0" && test "$USER_ID" != "root"
+
+      - name: Validate - vulnerability scan
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.69.3 image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"
+
+      - name: Push image to GitHub Container Registry
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+
+  deploy:
+    needs: build-validate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build-validate.outputs.image }}
+    steps:
+      - name: Get manifests
+        uses: actions/checkout@v7
+
+      - name: Create Kubernetes cluster (kind)
+        run: kind create cluster --wait 120s
+
+      - name: Load image into the cluster
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$IMAGE"
+          kind load docker-image "$IMAGE"
+
+      - name: Deploy
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|" k8s/deployment.yaml
+          kubectl apply -f k8s/
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/demo-app --timeout=180s
+
+      - name: Verify application through the Service
+        run: |
+          kubectl port-forward service/demo-app 9090:80 &
+          sleep 5
+          curl -fsS --retry 10 --retry-delay 2 --retry-all-errors http://localhost:9090/
+
+      - name: Show debug information on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe deployment demo-app
+          kubectl logs -l app=demo-app --tail=100
